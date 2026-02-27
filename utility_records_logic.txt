@@ -1,0 +1,41 @@
+The filenames will be as given below
+
+T C Eb readings.xls
+T C Dg readings.xls
+T C Water readings.xls
+T C Gas Readings.xls
+
+A.) All filenames start with a T (denotes tower) followed by a space and then a single alphabet - the alphabet denotes the tower - the mapping of the single alphabet to the tower is given below
+
+tower_id,tower_name
+A,Platinum
+B,Titanium
+C,Aurum
+D,Argentum
+E,Pearl
+F,Crystal
+G,Jade
+H,Turquoise
+J,Amethyst
+K,Aquamarine
+L,Opal
+M,Sapphire
+N,Ruby
+P,Lakeside
+
+B.) the word after the alphabet that denotes tower will denote the type of utility (Gas, Water, Diesel, Electricity etc.) - therefore, Eb stands for Electricity Dg stands for Diesel, Water stands for Water and Gas stands for Gas - store the utility type based on this description
+only The data from the first sheet needs to be processed. The characteristics of the sheet1 is as follows:
+C.) Cell and Row values:
+
+	1.) Cell A1 contains Text - store the text in a varaible
+	2.) The data in Row 2 is as follows:
+		a.) Cell A2 = contains the text "Recorded Date/Time" - which denotes that the subsequent rows for that cell will contain date and time in "dd-mm-yyyy  hh:mm" format 
+		b.) Cell B1 onwards contain the id of the flat - based on the tower_name that is derived based on the second alphabet in the filename, the value in the cell should be taken and the the value of given_flat_id should be derived - for e.g. if the cell value is "G001" and the filename is "T C Eb readings.xls" - then the derived given_flat_id should be AurumG001.
+	3.) Row 3 will always be empty, so ignored the same
+	4.) The data from 4th row onwards are the meter readings for the specific utility - the Value in A4 to A(N) (N denotes a number) will contain date and time in "dd-mm-yyyy hh:mm" format  - please note that there could be trailing spaces in the data that need to be trimmed to get the correct dd-mm-yyyy hh:mm values.
+	4.) Each row for this cell will contain data for a 15 minute interval. So, Say A4 contains "12-01-2025 00:00:00" then the A5 cell should contain "12-01-2025 00:15:00" - if the Value in A5 is same as the value in A4, then ignore all the data in that row since it is a duplicate of the previous row. The same logic should be applied to all the rows - meaning if the previous row for that cell has the same value as the next cell, then that row should be ignored.
+D.) The data in the rows should be consilidated as a single record which contains the valid starting reading for a specific day and the last reading for that day - please note that the data in the sheet will be spread across multiple days. These records should be output in the following format:
+    
+	Type_of_utility,given_flat_id,date,starting_reading,closing_reading
+	
+	If you have any questions before you start coding, please ask for clarifications.
