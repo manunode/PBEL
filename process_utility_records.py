@@ -142,6 +142,12 @@ def process_file(filepath):
             trimmed = raw_dt.strip()
             if not trimmed:
                 continue
+            # Strip trailing AM/PM (time is already in 24-hour format)
+            trimmed = trimmed.rstrip()
+            for suffix in (" AM", " PM", " am", " pm"):
+                if trimmed.endswith(suffix):
+                    trimmed = trimmed[:-len(suffix)].rstrip()
+                    break
             try:
                 dt_val = datetime.datetime.strptime(trimmed, "%d-%m-%Y %H:%M")
             except ValueError:
