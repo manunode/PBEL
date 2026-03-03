@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.duckdb
+*.duckdb.wal
+pbel_utility
+archive/
