@@ -43,6 +43,93 @@ DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "util
 DEFAULT_ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive")
 
 
+# ── Period / date-range helpers ───────────────────────────────────────────
+
+def parse_period(period_str):
+    """
+    Parse a flexible period string into (start_month, end_month) tuple.
+
+    Accepted formats:
+      '2026-08'           → ('2026-08', '2026-08')       single month
+      '2026-01:2026-06'   → ('2026-01', '2026-06')       explicit range
+      '2026'              → ('2026-01', '2026-12')        full year
+      '2026-H1'           → ('2026-01', '2026-06')        first half
+      '2026-H2'           → ('2026-07', '2026-12')        second half
+      '2026-Q1'           → ('2026-01', '2026-03')        quarter
+      '2026-Q2'           → ('2026-04', '2026-06')
+      '2026-Q3'           → ('2026-07', '2026-09')
+      '2026-Q4'           → ('2026-10', '2026-12')
+    """
+    import re
+    s = re.sub(r'[_/.]', '-', period_str.strip())
+
+    # Range: 2026-01:2026-06
+    if ':' in s:
+        parts = s.split(':')
+        if len(parts) != 2:
+            _period_error(period_str)
+        start, end = parts
+        if not (re.match(r'^\d{4}-\d{2}$', start) and re.match(r'^\d{4}-\d{2}$', end)):
+            _period_error(period_str)
+        return (start, end)
+
+    # Full year: 2026
+    if re.match(r'^\d{4}$', s):
+        return (f"{s}-01", f"{s}-12")
+
+    # Half year: 2026-H1, 2026-H2
+    m = re.match(r'^(\d{4})-H([12])$', s, re.IGNORECASE)
+    if m:
+        year, half = m.group(1), int(m.group(2))
+        if half == 1:
+            return (f"{year}-01", f"{year}-06")
+        else:
+            return (f"{year}-07", f"{year}-12")
+
+    # Quarter: 2026-Q1..Q4
+    m = re.match(r'^(\d{4})-Q([1-4])$', s, re.IGNORECASE)
+    if m:
+        year, q = m.group(1), int(m.group(2))
+        start_m = (q - 1) * 3 + 1
+        end_m = q * 3
+        return (f"{year}-{start_m:02d}", f"{year}-{end_m:02d}")
+
+    # Single month: 2026-08
+    if re.match(r'^\d{4}-\d{2}$', s):
+        return (s, s)
+
+    _period_error(period_str)
+
+
+def _period_error(period_str):
+    print(f"ERROR: Invalid period '{period_str}'.")
+    print("  Accepted formats:")
+    print("    YYYY-MM              single month    (e.g. 2026-08)")
+    print("    YYYY-MM:YYYY-MM      explicit range  (e.g. 2026-01:2026-06)")
+    print("    YYYY                 full year       (e.g. 2026)")
+    print("    YYYY-H1 / YYYY-H2   half year       (e.g. 2026-H1)")
+    print("    YYYY-Q1..Q4          quarter         (e.g. 2026-Q3)")
+    sys.exit(1)
+
+
+def month_filter_sql(col, start_month, end_month):
+    """
+    Return (sql_fragment, params) for filtering a YYYY-MM column/expression.
+    Single month uses '=', ranges use 'BETWEEN'.
+    """
+    if start_month == end_month:
+        return f"{col} = ?", [start_month]
+    else:
+        return f"{col} BETWEEN ? AND ?", [start_month, end_month]
+
+
+def period_label(start_month, end_month):
+    """Human-readable label for a period."""
+    if start_month == end_month:
+        return start_month
+    return f"{start_month} to {end_month}"
+
+
 # ── Schema ─────────────────────────────────────────────────────────────────
 
 def init_db(db_path=DEFAULT_DB_PATH):
@@ -494,114 +581,120 @@ def query_flat_readings(con, given_flat_id, start_date, end_date, utility_type=N
     return con.execute(query, params).fetchdf()
 
 
-def detect_discrepancies(con, year_month):
+def detect_discrepancies(con, start_month, end_month=None):
     """
-    Detect potential discrepancies in granular readings for a given month:
-    - Backward readings (meter going backwards)
-    - Zero consumption (no change all month)
-    - Gap detection (missing 15-min intervals)
-    - Spike detection (abnormal consumption in a single interval)
-    - Stale-then-resume (flat for extended period, then resumes)
-    - NULL reading values (missing data points)
-    - Out-of-order timestamps (non-monotonic within a source file)
+    Detect potential discrepancies in granular readings for a period.
+    Accepts single month or a range. When spanning multiple months,
+    also produces a 'repeat offenders' summary.
     """
+    if end_month is None:
+        end_month = start_month
+    label = period_label(start_month, end_month)
+    multi = start_month != end_month
+    mf_sql, mf_params = month_filter_sql("strftime(recorded_at, '%Y-%m')", start_month, end_month)
+
     # Scan metadata
-    scan_stats = con.execute("""
+    scan_stats = con.execute(f"""
         SELECT COUNT(*) AS total_records,
                COUNT(DISTINCT given_flat_id) AS distinct_flats,
                COUNT(DISTINCT utility_type) AS distinct_utilities,
                MIN(recorded_at) AS earliest,
-               MAX(recorded_at) AS latest
+               MAX(recorded_at) AS latest,
+               COUNT(DISTINCT strftime(recorded_at, '%Y-%m')) AS months_covered
         FROM readings
-        WHERE strftime(recorded_at, '%Y-%m') = ?
-    """, [year_month]).fetchone()
+        WHERE {mf_sql}
+    """, mf_params).fetchone()
 
     check_names = [
         "Backward readings",
         "Zero consumption",
         "Gap detection (missing intervals)",
-        "Spike detection (>3σ)",
+        "Spike detection (>3\u03c3)",
         "Stale-then-resume (>24h flat)",
         "NULL readings",
         "Out-of-order timestamps",
     ]
 
-    print(f"Running granular discrepancy checks for {year_month}...")
+    print(f"Running granular discrepancy checks for {label}...")
     print(f"  Scanning: {scan_stats[0]:,} records | {scan_stats[1]:,} flats | "
-          f"{scan_stats[2]} utility types | {scan_stats[3]} to {scan_stats[4]}")
+          f"{scan_stats[2]} utility types | {scan_stats[5]} months | {scan_stats[3]} to {scan_stats[4]}")
     print(f"  Checks:  {', '.join(check_names)}")
     print(f"  {'─' * 72}")
     results = {}
 
-    # 1. Backward readings (meter going backwards)
-    backward = con.execute("""
+    # 1. Backward readings
+    backward = con.execute(f"""
         WITH lagged AS (
             SELECT
                 utility_type, given_flat_id, recorded_at, reading_value,
+                strftime(recorded_at, '%Y-%m') AS month,
                 LAG(reading_value) OVER (
                     PARTITION BY utility_type, given_flat_id
                     ORDER BY recorded_at
                 ) AS prev_value
             FROM readings
-            WHERE strftime(recorded_at, '%Y-%m') = ?
+            WHERE {mf_sql}
               AND reading_value IS NOT NULL
         )
-        SELECT utility_type, given_flat_id, recorded_at, reading_value,
+        SELECT utility_type, given_flat_id, month, recorded_at, reading_value,
                prev_value, reading_value - prev_value AS delta
         FROM lagged
         WHERE prev_value IS NOT NULL
           AND reading_value < prev_value
         ORDER BY utility_type, given_flat_id, recorded_at
-    """, [year_month]).fetchdf()
+    """, mf_params).fetchdf()
     results["backward"] = backward
 
     if not backward.empty:
         print(f"\n  1. BACKWARD READINGS ({len(backward)} instances):")
         print(backward.head(20).to_string(index=False))
+        if len(backward) > 20:
+            print(f"     ... and {len(backward) - 20} more.")
     else:
         print("\n  1. BACKWARD READINGS: None detected.")
 
-    # 2. Zero consumption (no change all month)
-    zero_consumption = con.execute("""
+    # 2. Zero consumption — per month per flat (no change within a month)
+    zero_consumption = con.execute(f"""
         WITH flat_range AS (
             SELECT
                 utility_type, given_flat_id,
+                strftime(recorded_at, '%Y-%m') AS month,
                 MIN(reading_value) AS min_val,
                 MAX(reading_value) AS max_val,
                 COUNT(*) AS num_readings
             FROM readings
-            WHERE strftime(recorded_at, '%Y-%m') = ?
+            WHERE {mf_sql}
               AND reading_value IS NOT NULL
-            GROUP BY utility_type, given_flat_id
+            GROUP BY utility_type, given_flat_id, strftime(recorded_at, '%Y-%m')
         )
         SELECT * FROM flat_range
         WHERE min_val = max_val AND num_readings > 1
-        ORDER BY utility_type, given_flat_id
-    """, [year_month]).fetchdf()
+        ORDER BY month, utility_type, given_flat_id
+    """, mf_params).fetchdf()
     results["zero_consumption"] = zero_consumption
 
     if not zero_consumption.empty:
-        print(f"\n  2. ZERO CONSUMPTION ({len(zero_consumption)} flat/utility combos):")
+        print(f"\n  2. ZERO CONSUMPTION ({len(zero_consumption)} flat/utility/month combos):")
         print(zero_consumption.head(20).to_string(index=False))
+        if len(zero_consumption) > 20:
+            print(f"     ... and {len(zero_consumption) - 20} more.")
     else:
         print("\n  2. ZERO CONSUMPTION: None detected.")
 
-    # 3. Gap detection — flats with significantly fewer readings than expected
-    # Expected: ~96/day. Flag if a flat has <80% of the median reading count.
-    gaps = con.execute("""
+    # 3. Gap detection
+    gaps = con.execute(f"""
         WITH counts AS (
             SELECT
                 utility_type, given_flat_id,
                 CAST(recorded_at AS DATE) AS reading_date,
                 COUNT(*) AS readings_per_day
             FROM readings
-            WHERE strftime(recorded_at, '%Y-%m') = ?
+            WHERE {mf_sql}
             GROUP BY utility_type, given_flat_id, CAST(recorded_at AS DATE)
         ),
         daily_median AS (
-            SELECT
-                reading_date,
-                MEDIAN(readings_per_day) AS median_count
+            SELECT reading_date,
+                   MEDIAN(readings_per_day) AS median_count
             FROM counts
             GROUP BY reading_date
         )
@@ -613,7 +706,7 @@ def detect_discrepancies(con, year_month):
         WHERE c.readings_per_day < 0.8 * d.median_count
           AND d.median_count > 0
         ORDER BY c.reading_date, c.utility_type, c.given_flat_id
-    """, [year_month]).fetchdf()
+    """, mf_params).fetchdf()
     results["gaps"] = gaps
 
     if not gaps.empty:
@@ -624,30 +717,30 @@ def detect_discrepancies(con, year_month):
     else:
         print("\n  3. GAP DETECTION: All flats have expected reading counts.")
 
-    # 4. Spike detection — single-interval consumption > 3 std dev from the flat's mean
-    spikes = con.execute("""
+    # 4. Spike detection
+    spikes = con.execute(f"""
         WITH deltas AS (
             SELECT
                 utility_type, given_flat_id, recorded_at, reading_value,
+                strftime(recorded_at, '%Y-%m') AS month,
                 reading_value - LAG(reading_value) OVER (
                     PARTITION BY utility_type, given_flat_id
                     ORDER BY recorded_at
                 ) AS delta
             FROM readings
-            WHERE strftime(recorded_at, '%Y-%m') = ?
+            WHERE {mf_sql}
               AND reading_value IS NOT NULL
         ),
         stats AS (
-            SELECT
-                utility_type, given_flat_id,
-                AVG(delta) AS mean_delta,
-                STDDEV(delta) AS std_delta
+            SELECT utility_type, given_flat_id,
+                   AVG(delta) AS mean_delta,
+                   STDDEV(delta) AS std_delta
             FROM deltas
             WHERE delta IS NOT NULL AND delta >= 0
             GROUP BY utility_type, given_flat_id
             HAVING STDDEV(delta) > 0
         )
-        SELECT d.utility_type, d.given_flat_id, d.recorded_at,
+        SELECT d.utility_type, d.given_flat_id, d.month, d.recorded_at,
                ROUND(d.delta, 4) AS delta,
                ROUND(s.mean_delta, 4) AS mean_delta,
                ROUND(s.std_delta, 4) AS std_delta,
@@ -660,7 +753,7 @@ def detect_discrepancies(con, year_month):
           AND d.delta > 0
           AND (d.delta - s.mean_delta) / s.std_delta > 3
         ORDER BY (d.delta - s.mean_delta) / s.std_delta DESC
-    """, [year_month]).fetchdf()
+    """, mf_params).fetchdf()
     results["spikes"] = spikes
 
     if not spikes.empty:
@@ -671,8 +764,8 @@ def detect_discrepancies(con, year_month):
     else:
         print("\n  4. SPIKE DETECTION: No abnormal spikes detected.")
 
-    # 5. Stale-then-resume — reading unchanged for 24+ hours then changes
-    stale = con.execute("""
+    # 5. Stale-then-resume
+    stale = con.execute(f"""
         WITH lagged AS (
             SELECT
                 utility_type, given_flat_id, recorded_at, reading_value,
@@ -685,7 +778,7 @@ def detect_discrepancies(con, year_month):
                     ORDER BY recorded_at
                 ) AS prev_time
             FROM readings
-            WHERE strftime(recorded_at, '%Y-%m') = ?
+            WHERE {mf_sql}
               AND reading_value IS NOT NULL
         ),
         runs AS (
@@ -720,7 +813,7 @@ def detect_discrepancies(con, year_month):
                stale_duration
         FROM stale_runs
         ORDER BY stale_duration DESC, utility_type, given_flat_id
-    """, [year_month]).fetchdf()
+    """, mf_params).fetchdf()
     results["stale"] = stale
 
     if not stale.empty:
@@ -731,22 +824,24 @@ def detect_discrepancies(con, year_month):
     else:
         print("\n  5. STALE-THEN-RESUME: No extended stale periods detected.")
 
-    # 6. NULL reading values — timestamps where a flat has NULL while others don't
-    nulls = con.execute("""
+    # 6. NULL readings
+    nulls = con.execute(f"""
         WITH null_readings AS (
-            SELECT utility_type, given_flat_id, recorded_at, source_file
+            SELECT utility_type, given_flat_id, recorded_at, source_file,
+                   strftime(recorded_at, '%Y-%m') AS month
             FROM readings
-            WHERE strftime(recorded_at, '%Y-%m') = ?
+            WHERE {mf_sql}
               AND reading_value IS NULL
         )
         SELECT utility_type, given_flat_id,
                COUNT(*) AS null_count,
+               COUNT(DISTINCT month) AS months_affected,
                MIN(recorded_at) AS first_null,
                MAX(recorded_at) AS last_null
         FROM null_readings
         GROUP BY utility_type, given_flat_id
         ORDER BY null_count DESC, utility_type, given_flat_id
-    """, [year_month]).fetchdf()
+    """, mf_params).fetchdf()
     results["nulls"] = nulls
 
     if not nulls.empty:
@@ -757,8 +852,8 @@ def detect_discrepancies(con, year_month):
     else:
         print("\n  6. NULL READINGS: No missing values detected.")
 
-    # 7. Out-of-order timestamps — within a source file, timestamps should be monotonic
-    out_of_order = con.execute("""
+    # 7. Out-of-order timestamps
+    out_of_order = con.execute(f"""
         WITH sequenced AS (
             SELECT
                 utility_type, given_flat_id, recorded_at, source_file,
@@ -767,7 +862,7 @@ def detect_discrepancies(con, year_month):
                     ORDER BY recorded_at
                 ) AS prev_time
             FROM readings
-            WHERE strftime(recorded_at, '%Y-%m') = ?
+            WHERE {mf_sql}
         )
         SELECT source_file, utility_type, given_flat_id,
                prev_time, recorded_at,
@@ -776,7 +871,7 @@ def detect_discrepancies(con, year_month):
         WHERE prev_time IS NOT NULL
           AND recorded_at < prev_time
         ORDER BY source_file, given_flat_id, recorded_at
-    """, [year_month]).fetchdf()
+    """, mf_params).fetchdf()
     results["out_of_order"] = out_of_order
 
     if not out_of_order.empty:
@@ -785,13 +880,37 @@ def detect_discrepancies(con, year_month):
     else:
         print("\n  7. OUT-OF-ORDER TIMESTAMPS: All timestamps monotonically increasing.")
 
-    # Summary report
+    # ── Repeat offenders (only for multi-month ranges) ────────────────────
+    if multi:
+        print(f"\n  {'═' * 72}")
+        print(f"  REPEAT OFFENDERS — flats flagged in multiple months ({label})")
+        print(f"  {'─' * 72}")
+        _print_repeat_offenders(results, check_col_map={
+            "backward": "given_flat_id",
+            "zero_consumption": "given_flat_id",
+            "gaps": "given_flat_id",
+            "spikes": "given_flat_id",
+            "stale": "given_flat_id",
+            "nulls": "given_flat_id",
+            "out_of_order": "given_flat_id",
+        }, month_col_map={
+            "backward": "month",
+            "zero_consumption": "month",
+            "gaps": "reading_date",
+            "spikes": "month",
+            "stale": "stale_from",
+            "nulls": "months_affected",
+            "out_of_order": None,
+        }, check_names=check_names)
+
+    # ── Summary report ────────────────────────────────────────────────────
     total_issues = sum(len(v) for v in results.values())
     flagged = sum(1 for v in results.values() if len(v) > 0)
     print(f"\n  {'─' * 72}")
-    print(f"  SCAN SUMMARY — {year_month}")
+    print(f"  SCAN SUMMARY — {label}")
     print(f"  Records scanned : {scan_stats[0]:>10,}")
     print(f"  Flats scanned   : {scan_stats[1]:>10,}")
+    print(f"  Months covered  : {scan_stats[5]:>10,}")
     print(f"  Total issues    : {total_issues:>10,}")
     print(f"  Categories hit  : {flagged}/{len(check_names)}")
     print()
@@ -805,35 +924,84 @@ def detect_discrepancies(con, year_month):
     return results
 
 
-def _summary_where(year_month, base_condition=""):
-    """Helper to build WHERE clause with optional year_month filter."""
+def _print_repeat_offenders(results, check_col_map, month_col_map, check_names):
+    """Print flats that appear in multiple months across check categories."""
+    result_keys = list(check_col_map.keys())
+    any_repeats = False
+
+    for key, name in zip(result_keys, check_names):
+        df = results.get(key)
+        if df is None or df.empty:
+            continue
+
+        flat_col = check_col_map[key]
+        month_info = month_col_map.get(key)
+
+        if flat_col not in df.columns:
+            continue
+
+        # For checks that already have a month column, count distinct months per flat
+        if month_info and month_info in df.columns and month_info != "months_affected":
+            # Derive month from date column if needed
+            if df[month_info].dtype == 'object' or 'date' in month_info.lower():
+                df = df.copy()
+                df['_month'] = df[month_info].astype(str).str[:7]
+            else:
+                df['_month'] = df[month_info].astype(str).str[:7]
+
+            repeat = df.groupby(flat_col).agg(
+                times_flagged=('_month', 'count'),
+                months_flagged=('_month', 'nunique'),
+                month_list=('_month', lambda x: ', '.join(sorted(x.unique())))
+            ).reset_index()
+            repeat = repeat[repeat['months_flagged'] > 1].sort_values('months_flagged', ascending=False)
+        elif month_info == "months_affected" and month_info in df.columns:
+            # Already aggregated (e.g. nulls)
+            repeat = df[df[month_info] > 1][[flat_col, month_info]].copy()
+            repeat = repeat.rename(columns={month_info: 'months_flagged'})
+            repeat['times_flagged'] = repeat['months_flagged']
+            repeat = repeat.sort_values('months_flagged', ascending=False)
+        else:
+            continue
+
+        if not repeat.empty:
+            any_repeats = True
+            print(f"\n    {name} — {len(repeat)} repeat offenders:")
+            print(f"    {repeat.head(15).to_string(index=False)}")
+            if len(repeat) > 15:
+                print(f"    ... and {len(repeat) - 15} more.")
+
+    if not any_repeats:
+        print("\n    No repeat offenders found across months.")
+
+
+def _summary_where(start_month, end_month, base_condition=""):
+    """Helper to build WHERE clause with optional period filter for monthly_summary."""
     clauses = []
     params = []
-    if year_month:
-        clauses.append("year_month = ?")
-        params.append(year_month)
+    if start_month:
+        frag, p = month_filter_sql("year_month", start_month, end_month or start_month)
+        clauses.append(frag)
+        params.extend(p)
     if base_condition:
         clauses.append(base_condition)
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     return where, params
 
 
-def detect_summary_discrepancies(con, year_month=None):
+def detect_summary_discrepancies(con, start_month=None, end_month=None):
     """
-    Detect anomalies in the monthly_summary table:
-    - Negative consumption
-    - Zero consumption
-    - Late opening reading (after day 2)
-    - Missing months (gaps in coverage)
-    - Month continuity (prev closing != current opening)
-    - Outlier consumption (>3 std dev from flat's historical avg)
-    - Early closing timestamp (before day 28)
-    - Cross-utility correlation (electricity zero but water high, etc.)
+    Detect anomalies in the monthly_summary table.
+    Accepts a period range; shows repeat offenders when spanning multiple months.
     """
-    scope = f"for {year_month}" if year_month else "across all months"
+    if start_month and not end_month:
+        end_month = start_month
+    multi = start_month and start_month != end_month
+    label = period_label(start_month, end_month) if start_month else "all months"
+    scope = f"for {label}" if start_month else "across all months"
 
     # Scan metadata
-    where_count, params_count = _summary_where(year_month)
+    where_count, params_count = _summary_where(start_month, end_month)
     scan_stats = con.execute(f"""
         SELECT COUNT(*) AS total_rows,
                COUNT(DISTINCT given_flat_id) AS distinct_flats,
@@ -848,7 +1016,7 @@ def detect_summary_discrepancies(con, year_month=None):
         "Late opening reading (day > 2)",
         "Early closing timestamp (day < 28)",
         "Month continuity breaks",
-        "Outlier consumption (>3σ)",
+        "Outlier consumption (>3\u03c3)",
         "Cross-utility mismatch",
         "Missing months",
     ]
@@ -861,7 +1029,7 @@ def detect_summary_discrepancies(con, year_month=None):
     results = {}
 
     # 1. Negative consumption
-    where, params = _summary_where(year_month, "(closing_reading - opening_reading) < 0")
+    where, params = _summary_where(start_month, end_month, "(closing_reading - opening_reading) < 0")
     neg = con.execute(f"""
         SELECT utility_type, given_flat_id, year_month,
                opening_reading, closing_reading,
@@ -878,12 +1046,12 @@ def detect_summary_discrepancies(con, year_month=None):
         print("\n  1. NEGATIVE CONSUMPTION: None.")
 
     # 2. Zero consumption
-    where, params = _summary_where(year_month, "closing_reading = opening_reading")
+    where, params = _summary_where(start_month, end_month, "closing_reading = opening_reading")
     zero = con.execute(f"""
         SELECT utility_type, given_flat_id, year_month,
                opening_reading, closing_reading
         FROM monthly_summary {where}
-        ORDER BY utility_type, given_flat_id
+        ORDER BY year_month, utility_type, given_flat_id
     """, params).fetchdf()
     results["zero"] = zero
 
@@ -894,7 +1062,7 @@ def detect_summary_discrepancies(con, year_month=None):
         print("\n  2. ZERO CONSUMPTION: None.")
 
     # 3. Late opening reading (after day 2)
-    where, params = _summary_where(year_month, "CAST(strftime(opening_timestamp, '%d') AS INT) > 2")
+    where, params = _summary_where(start_month, end_month, "CAST(strftime(opening_timestamp, '%d') AS INT) > 2")
     late_start = con.execute(f"""
         SELECT utility_type, given_flat_id, year_month,
                opening_timestamp,
@@ -911,7 +1079,7 @@ def detect_summary_discrepancies(con, year_month=None):
         print("\n  3. LATE OPENING READING: All within first 2 days.")
 
     # 4. Early closing timestamp (before day 28)
-    where, params = _summary_where(year_month, "CAST(strftime(closing_timestamp, '%d') AS INT) < 28")
+    where, params = _summary_where(start_month, end_month, "CAST(strftime(closing_timestamp, '%d') AS INT) < 28")
     early_close = con.execute(f"""
         SELECT utility_type, given_flat_id, year_month,
                closing_timestamp,
@@ -929,51 +1097,37 @@ def detect_summary_discrepancies(con, year_month=None):
     else:
         print("\n  4. EARLY CLOSING TIMESTAMP: All closing readings at or after day 28.")
 
-    # 5. Month continuity — previous month's closing should equal current month's opening
-    if year_month:
-        # Derive previous month
-        y, m = map(int, year_month.split("-"))
-        if m == 1:
-            prev_month = f"{y - 1:04d}-12"
-        else:
-            prev_month = f"{y:04d}-{m - 1:02d}"
-        continuity = con.execute("""
-            SELECT
-                c.utility_type, c.given_flat_id, c.year_month,
-                p.closing_reading AS prev_closing,
-                c.opening_reading AS curr_opening,
-                c.opening_reading - p.closing_reading AS gap
-            FROM monthly_summary c
-            JOIN monthly_summary p
-              ON c.utility_type = p.utility_type
-             AND c.given_flat_id = p.given_flat_id
-             AND p.year_month = ?
-            WHERE c.year_month = ?
-              AND ABS(c.opening_reading - p.closing_reading) > 0.001
-            ORDER BY ABS(c.opening_reading - p.closing_reading) DESC
-        """, [prev_month, year_month]).fetchdf()
-    else:
-        continuity = con.execute("""
-            WITH ordered AS (
-                SELECT *,
-                    LAG(closing_reading) OVER (
-                        PARTITION BY utility_type, given_flat_id
-                        ORDER BY year_month
-                    ) AS prev_closing,
-                    LAG(year_month) OVER (
-                        PARTITION BY utility_type, given_flat_id
-                        ORDER BY year_month
-                    ) AS prev_month
-                FROM monthly_summary
-            )
-            SELECT utility_type, given_flat_id, year_month,
-                   prev_month, prev_closing, opening_reading AS curr_opening,
-                   opening_reading - prev_closing AS gap
-            FROM ordered
-            WHERE prev_closing IS NOT NULL
-              AND ABS(opening_reading - prev_closing) > 0.001
-            ORDER BY ABS(opening_reading - prev_closing) DESC
-        """).fetchdf()
+    # 5. Month continuity — previous closing should equal current opening
+    # Always use LAG-based approach (works for single month and ranges)
+    continuity_where, continuity_params = _summary_where(start_month, end_month)
+    continuity = con.execute(f"""
+        WITH scoped AS (
+            SELECT * FROM monthly_summary {continuity_where}
+        ),
+        ordered AS (
+            SELECT s.*,
+                LAG(s.closing_reading) OVER (
+                    PARTITION BY s.utility_type, s.given_flat_id
+                    ORDER BY s.year_month
+                ) AS prev_closing,
+                LAG(s.year_month) OVER (
+                    PARTITION BY s.utility_type, s.given_flat_id
+                    ORDER BY s.year_month
+                ) AS prev_month
+            FROM monthly_summary s
+        )
+        SELECT o.utility_type, o.given_flat_id, o.year_month,
+               o.prev_month, o.prev_closing, o.opening_reading AS curr_opening,
+               o.opening_reading - o.prev_closing AS gap
+        FROM ordered o
+        INNER JOIN scoped sc
+            ON o.utility_type = sc.utility_type
+           AND o.given_flat_id = sc.given_flat_id
+           AND o.year_month = sc.year_month
+        WHERE o.prev_closing IS NOT NULL
+          AND ABS(o.opening_reading - o.prev_closing) > 0.001
+        ORDER BY ABS(o.opening_reading - o.prev_closing) DESC
+    """, continuity_params).fetchdf()
     results["continuity"] = continuity
 
     if not continuity.empty:
@@ -984,65 +1138,37 @@ def detect_summary_discrepancies(con, year_month=None):
     else:
         print("\n  5. MONTH CONTINUITY: All opening readings match previous closing.")
 
-    # 6. Outlier consumption — >3 std dev from the flat's own historical average
-    # Only meaningful with multiple months of data
-    if year_month:
-        outliers = con.execute("""
-            WITH consumption AS (
-                SELECT utility_type, given_flat_id, year_month,
-                       closing_reading - opening_reading AS consumption
-                FROM monthly_summary
-            ),
-            stats AS (
-                SELECT utility_type, given_flat_id,
-                       AVG(consumption) AS mean_consumption,
-                       STDDEV(consumption) AS std_consumption,
-                       COUNT(*) AS num_months
-                FROM consumption
-                GROUP BY utility_type, given_flat_id
-                HAVING COUNT(*) >= 3 AND STDDEV(consumption) > 0
-            )
-            SELECT c.utility_type, c.given_flat_id, c.year_month,
-                   ROUND(c.consumption, 4) AS consumption,
-                   ROUND(s.mean_consumption, 4) AS historical_mean,
-                   ROUND(s.std_consumption, 4) AS historical_std,
-                   ROUND((c.consumption - s.mean_consumption) / s.std_consumption, 2) AS z_score
-            FROM consumption c
-            JOIN stats s
-              ON c.utility_type = s.utility_type
-             AND c.given_flat_id = s.given_flat_id
-            WHERE c.year_month = ?
-              AND ABS(c.consumption - s.mean_consumption) / s.std_consumption > 3
-            ORDER BY ABS((c.consumption - s.mean_consumption) / s.std_consumption) DESC
-        """, [year_month]).fetchdf()
-    else:
-        outliers = con.execute("""
-            WITH consumption AS (
-                SELECT utility_type, given_flat_id, year_month,
-                       closing_reading - opening_reading AS consumption
-                FROM monthly_summary
-            ),
-            stats AS (
-                SELECT utility_type, given_flat_id,
-                       AVG(consumption) AS mean_consumption,
-                       STDDEV(consumption) AS std_consumption,
-                       COUNT(*) AS num_months
-                FROM consumption
-                GROUP BY utility_type, given_flat_id
-                HAVING COUNT(*) >= 3 AND STDDEV(consumption) > 0
-            )
-            SELECT c.utility_type, c.given_flat_id, c.year_month,
-                   ROUND(c.consumption, 4) AS consumption,
-                   ROUND(s.mean_consumption, 4) AS historical_mean,
-                   ROUND(s.std_consumption, 4) AS historical_std,
-                   ROUND((c.consumption - s.mean_consumption) / s.std_consumption, 2) AS z_score
-            FROM consumption c
-            JOIN stats s
-              ON c.utility_type = s.utility_type
-             AND c.given_flat_id = s.given_flat_id
-            WHERE ABS(c.consumption - s.mean_consumption) / s.std_consumption > 3
-            ORDER BY ABS((c.consumption - s.mean_consumption) / s.std_consumption) DESC
-        """).fetchdf()
+    # 6. Outlier consumption — >3 std dev from historical avg
+    # Stats computed over ALL history; filtering applies to which months we flag
+    mf_sql, mf_params = month_filter_sql("c.year_month", start_month, end_month) if start_month else ("1=1", [])
+    outliers = con.execute(f"""
+        WITH consumption AS (
+            SELECT utility_type, given_flat_id, year_month,
+                   closing_reading - opening_reading AS consumption
+            FROM monthly_summary
+        ),
+        stats AS (
+            SELECT utility_type, given_flat_id,
+                   AVG(consumption) AS mean_consumption,
+                   STDDEV(consumption) AS std_consumption,
+                   COUNT(*) AS num_months
+            FROM consumption
+            GROUP BY utility_type, given_flat_id
+            HAVING COUNT(*) >= 3 AND STDDEV(consumption) > 0
+        )
+        SELECT c.utility_type, c.given_flat_id, c.year_month,
+               ROUND(c.consumption, 4) AS consumption,
+               ROUND(s.mean_consumption, 4) AS historical_mean,
+               ROUND(s.std_consumption, 4) AS historical_std,
+               ROUND((c.consumption - s.mean_consumption) / s.std_consumption, 2) AS z_score
+        FROM consumption c
+        JOIN stats s
+          ON c.utility_type = s.utility_type
+         AND c.given_flat_id = s.given_flat_id
+        WHERE {mf_sql}
+          AND ABS(c.consumption - s.mean_consumption) / s.std_consumption > 3
+        ORDER BY ABS((c.consumption - s.mean_consumption) / s.std_consumption) DESC
+    """, mf_params).fetchdf()
     results["outliers"] = outliers
 
     if not outliers.empty:
@@ -1053,8 +1179,8 @@ def detect_summary_discrepancies(con, year_month=None):
     else:
         print("\n  6. OUTLIER CONSUMPTION: None detected (requires >=3 months of history).")
 
-    # 7. Cross-utility correlation — zero consumption in one utility but not others
-    where, params = _summary_where(year_month)
+    # 7. Cross-utility correlation
+    where, params = _summary_where(start_month, end_month)
     cross_utility = con.execute(f"""
         WITH consumption AS (
             SELECT utility_type, given_flat_id, year_month,
@@ -1089,25 +1215,29 @@ def detect_summary_discrepancies(con, year_month=None):
     else:
         print("\n  7. CROSS-UTILITY MISMATCH: None detected.")
 
-    # 8. Missing months (gap detection across expected flat/utility/month combos)
-    if not year_month:
-        missing = con.execute("""
-            WITH combos AS (
-                SELECT DISTINCT given_flat_id, utility_type FROM monthly_summary
+    # 8. Missing months
+    if not start_month or multi:
+        where_mm, params_mm = _summary_where(start_month, end_month)
+        missing = con.execute(f"""
+            WITH scoped AS (
+                SELECT * FROM monthly_summary {where_mm}
+            ),
+            combos AS (
+                SELECT DISTINCT given_flat_id, utility_type FROM scoped
             ),
             months AS (
-                SELECT DISTINCT year_month FROM monthly_summary
+                SELECT DISTINCT year_month FROM scoped
             )
             SELECT c.given_flat_id, c.utility_type, m.year_month
             FROM combos c
             CROSS JOIN months m
-            LEFT JOIN monthly_summary s
+            LEFT JOIN scoped s
                 ON c.given_flat_id = s.given_flat_id
                 AND c.utility_type = s.utility_type
                 AND m.year_month = s.year_month
             WHERE s.given_flat_id IS NULL
             ORDER BY c.given_flat_id, c.utility_type, m.year_month
-        """).fetchdf()
+        """, params_mm).fetchdf()
         results["missing_months"] = missing
 
         if not missing.empty:
@@ -1118,7 +1248,32 @@ def detect_summary_discrepancies(con, year_month=None):
         else:
             print("\n  8. MISSING MONTHS: Full coverage across all flat/utility/month combos.")
 
-    # Summary report
+    # ── Repeat offenders ──────────────────────────────────────────────────
+    if multi:
+        print(f"\n  {'═' * 72}")
+        print(f"  REPEAT OFFENDERS — flats flagged in multiple months ({label})")
+        print(f"  {'─' * 72}")
+        _print_repeat_offenders(results, check_col_map={
+            "negative": "given_flat_id",
+            "zero": "given_flat_id",
+            "late_start": "given_flat_id",
+            "early_close": "given_flat_id",
+            "continuity": "given_flat_id",
+            "outliers": "given_flat_id",
+            "cross_utility": "given_flat_id",
+            "missing_months": "given_flat_id",
+        }, month_col_map={
+            "negative": "year_month",
+            "zero": "year_month",
+            "late_start": "year_month",
+            "early_close": "year_month",
+            "continuity": "year_month",
+            "outliers": "year_month",
+            "cross_utility": "year_month",
+            "missing_months": "year_month",
+        }, check_names=check_names)
+
+    # ── Summary report ────────────────────────────────────────────────────
     total_issues = sum(len(v) for v in results.values())
     flagged = sum(1 for v in results.values() if len(v) > 0)
     total_checks = len(results)
@@ -1139,6 +1294,173 @@ def detect_summary_discrepancies(con, year_month=None):
         print(f"    [{marker}] {i}. {name:<35s} {status}")
     print(f"  {'─' * 72}")
     return results
+
+
+def check_cross_utility(con, start_month=None, end_month=None):
+    """
+    Cross-utility flat profile report.
+
+    For each flat, shows which utilities have data (and consumption) across months.
+    Groups flats by their utility presence pattern to surface anomalies like:
+      - Flat has electricity + water but no diesel
+      - Flat has diesel but no electricity
+      - Flat present in some months but not others for a specific utility
+    """
+    if start_month and not end_month:
+        end_month = start_month
+    label = period_label(start_month, end_month) if start_month else "all months"
+    where, params = _summary_where(start_month, end_month)
+
+    # Scan metadata
+    scan_stats = con.execute(f"""
+        SELECT COUNT(*) AS total_rows,
+               COUNT(DISTINCT given_flat_id) AS distinct_flats,
+               COUNT(DISTINCT utility_type) AS distinct_utilities,
+               COUNT(DISTINCT year_month) AS distinct_months
+        FROM monthly_summary {where}
+    """, params).fetchone()
+
+    all_utilities = con.execute(f"""
+        SELECT DISTINCT utility_type FROM monthly_summary {where}
+        ORDER BY utility_type
+    """, params).fetchdf()['utility_type'].tolist()
+
+    print(f"Cross-utility flat profile report — {label}")
+    print(f"  Scanning: {scan_stats[0]:,} summary rows | {scan_stats[1]:,} flats | "
+          f"{scan_stats[2]} utility types | {scan_stats[3]} months")
+    print(f"  Utilities in scope: {', '.join(all_utilities)}")
+    print(f"  {'─' * 72}")
+
+    # 1. Utility presence pattern — group flats by which utilities they have
+    pattern_df = con.execute(f"""
+        WITH flat_utils AS (
+            SELECT given_flat_id,
+                   LIST(DISTINCT utility_type ORDER BY utility_type) AS utilities_present,
+                   COUNT(DISTINCT utility_type) AS num_utilities,
+                   COUNT(DISTINCT year_month) AS months_active,
+                   ROUND(SUM(closing_reading - opening_reading), 2) AS total_consumption
+            FROM monthly_summary {where}
+            GROUP BY given_flat_id
+        )
+        SELECT utilities_present, num_utilities,
+               COUNT(*) AS num_flats,
+               LIST(given_flat_id ORDER BY given_flat_id) AS flat_ids
+        FROM flat_utils
+        GROUP BY utilities_present, num_utilities
+        ORDER BY num_flats DESC
+    """, params).fetchdf()
+
+    print(f"\n  1. UTILITY PRESENCE PATTERNS ({len(pattern_df)} distinct patterns across {scan_stats[1]:,} flats):")
+    expected_pattern = sorted(all_utilities)
+    for _, row in pattern_df.iterrows():
+        present = row['utilities_present']
+        n = row['num_flats']
+        is_complete = (row['num_utilities'] == len(all_utilities))
+        marker = "  " if is_complete else "!!"
+        flat_preview = str(row['flat_ids'])
+        if len(flat_preview) > 80:
+            flat_preview = flat_preview[:77] + "..."
+        print(f"    [{marker}] {str(present):<45s} {n:>5,} flats  {flat_preview}")
+
+    # 2. Per-flat utility × month matrix — flats missing utilities in some months
+    if scan_stats[3] > 1:
+        incomplete = con.execute(f"""
+            WITH scoped AS (
+                SELECT * FROM monthly_summary {where}
+            ),
+            all_combos AS (
+                SELECT DISTINCT f.given_flat_id, u.utility_type, m.year_month
+                FROM (SELECT DISTINCT given_flat_id FROM scoped) f
+                CROSS JOIN (SELECT DISTINCT utility_type FROM scoped) u
+                CROSS JOIN (SELECT DISTINCT year_month FROM scoped) m
+            ),
+            actual AS (
+                SELECT given_flat_id, utility_type, year_month, 1 AS present
+                FROM scoped
+            ),
+            gaps AS (
+                SELECT a.given_flat_id, a.utility_type, a.year_month
+                FROM all_combos a
+                LEFT JOIN actual act
+                    ON a.given_flat_id = act.given_flat_id
+                   AND a.utility_type = act.utility_type
+                   AND a.year_month = act.year_month
+                WHERE act.present IS NULL
+            )
+            SELECT given_flat_id,
+                   COUNT(*) AS missing_slots,
+                   LIST(DISTINCT utility_type ORDER BY utility_type) AS missing_utilities,
+                   LIST(DISTINCT year_month ORDER BY year_month) AS missing_months
+            FROM gaps
+            GROUP BY given_flat_id
+            ORDER BY missing_slots DESC, given_flat_id
+        """, params).fetchdf()
+
+        if not incomplete.empty:
+            print(f"\n  2. INCOMPLETE COVERAGE ({len(incomplete)} flats missing utility/month slots):")
+            print(incomplete.head(30).to_string(index=False))
+            if len(incomplete) > 30:
+                print(f"     ... and {len(incomplete) - 30} more.")
+        else:
+            print("\n  2. INCOMPLETE COVERAGE: All flats have all utilities for all months.")
+    else:
+        print("\n  2. INCOMPLETE COVERAGE: Skipped (need >1 month for coverage analysis).")
+
+    # 3. Zero-consumption utility profiles — flats where specific utilities have zero
+    #    consumption while others are active, aggregated across the period
+    zero_profiles = con.execute(f"""
+        WITH consumption AS (
+            SELECT given_flat_id, utility_type,
+                   SUM(closing_reading - opening_reading) AS total_consumption,
+                   COUNT(*) AS months_present
+            FROM monthly_summary {where}
+            GROUP BY given_flat_id, utility_type
+        ),
+        flat_profiles AS (
+            SELECT given_flat_id,
+                   LIST(utility_type ORDER BY utility_type) FILTER (WHERE total_consumption = 0) AS zero_utilities,
+                   LIST(utility_type ORDER BY utility_type) FILTER (WHERE total_consumption > 0) AS active_utilities,
+                   COUNT(*) FILTER (WHERE total_consumption = 0) AS zero_count,
+                   COUNT(*) FILTER (WHERE total_consumption > 0) AS active_count
+            FROM consumption
+            GROUP BY given_flat_id
+        )
+        SELECT given_flat_id, zero_utilities, active_utilities,
+               zero_count, active_count
+        FROM flat_profiles
+        WHERE zero_count > 0 AND active_count > 0
+        ORDER BY zero_count DESC, given_flat_id
+    """, params).fetchdf()
+
+    if not zero_profiles.empty:
+        print(f"\n  3. ZERO-CONSUMPTION PROFILES ({len(zero_profiles)} flats — zero total usage in some utilities):")
+        print(zero_profiles.head(30).to_string(index=False))
+        if len(zero_profiles) > 30:
+            print(f"     ... and {len(zero_profiles) - 30} more.")
+
+        # Group by pattern
+        pattern_summary = zero_profiles.groupby(
+            [zero_profiles['zero_utilities'].astype(str), zero_profiles['active_utilities'].astype(str)]
+        ).size().reset_index(name='count').sort_values('count', ascending=False)
+        print(f"\n    Grouped by pattern:")
+        for _, row in pattern_summary.iterrows():
+            print(f"      Zero: {row['zero_utilities']:<30s} Active: {row['active_utilities']:<30s} → {row['count']:,} flats")
+    else:
+        print("\n  3. ZERO-CONSUMPTION PROFILES: All flats have active consumption on all their utilities.")
+
+    # Summary
+    print(f"\n  {'─' * 72}")
+    print(f"  CROSS-UTILITY SUMMARY — {label}")
+    print(f"  Flats scanned       : {scan_stats[1]:>8,}")
+    print(f"  Utility types       : {scan_stats[2]:>8}")
+    print(f"  Presence patterns   : {len(pattern_df):>8}")
+    n_full = sum(1 for _, r in pattern_df.iterrows() if r['num_utilities'] == len(all_utilities))
+    n_partial = len(pattern_df) - n_full
+    print(f"  Full-utility flats  : {pattern_df[pattern_df['num_utilities'] == len(all_utilities)]['num_flats'].sum() if n_full else 0:>8,}")
+    print(f"  Partial patterns    : {n_partial:>8}")
+    if not zero_profiles.empty:
+        print(f"  Zero-on-some flats  : {len(zero_profiles):>8,}")
+    print(f"  {'─' * 72}")
 
 
 def detect_ingestion_issues(con, year_month, expected_files_per_day=14):
@@ -1290,6 +1612,11 @@ def db_stats(con):
 def main():
     import argparse
 
+    PERIOD_HELP = (
+        "Period: YYYY-MM (single month), YYYY-MM:YYYY-MM (range), "
+        "YYYY (full year), YYYY-H1/H2 (half), YYYY-Q1..Q4 (quarter)"
+    )
+
     parser = argparse.ArgumentParser(
         description="Utility Records Database Manager (DuckDB)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1310,11 +1637,19 @@ Examples:
   # Query a flat's readings
   python utility_db.py query AurumG001 2025-01-12 2025-01-15
 
-  # Run discrepancy detection on granular data for a month
-  python utility_db.py check 2025-01
+  # Run discrepancy detection — single month or range
+  python utility_db.py check 2026-08
+  python utility_db.py check 2026-01:2026-06
+  python utility_db.py check 2026
+  python utility_db.py check 2026-H1
 
   # Run discrepancy detection on monthly summaries
-  python utility_db.py check-summary [2025-01]
+  python utility_db.py check-summary 2026-H2
+  python utility_db.py check-summary              # all months
+
+  # Cross-utility flat profile report
+  python utility_db.py check-cross-utility 2026
+  python utility_db.py check-cross-utility         # all months
 
   # Run ingestion completeness checks
   python utility_db.py check-ingestion 2025-01 --expected-files 14
@@ -1347,10 +1682,13 @@ Examples:
     p_query.add_argument("--utility", help="Filter by utility type")
 
     p_check = sub.add_parser("check", help="Detect discrepancies in granular data")
-    p_check.add_argument("year_month", help="Month to check (YYYY-MM)")
+    p_check.add_argument("period", help=PERIOD_HELP)
 
     p_check_summary = sub.add_parser("check-summary", help="Detect anomalies in monthly summaries")
-    p_check_summary.add_argument("year_month", nargs="?", help="Limit to a specific month (YYYY-MM) – optional")
+    p_check_summary.add_argument("period", nargs="?", help=PERIOD_HELP + " (optional – omit for all months)")
+
+    p_check_cross = sub.add_parser("check-cross-utility", help="Cross-utility flat profile report")
+    p_check_cross.add_argument("period", nargs="?", help=PERIOD_HELP + " (optional – omit for all months)")
 
     p_check_ingest = sub.add_parser("check-ingestion", help="Check ingestion completeness and row counts")
     p_check_ingest.add_argument("year_month", help="Month to check (YYYY-MM)")
@@ -1364,7 +1702,7 @@ Examples:
         parser.print_help()
         sys.exit(1)
 
-    # Normalize year_month: accept 2026_08, 2026/08, 2026.08 → 2026-08
+    # Normalize year_month for single-month commands (summarize, archive, check-ingestion)
     if hasattr(args, "year_month") and args.year_month:
         import re
         normalized = re.sub(r'[_/.]', '-', args.year_month)
@@ -1374,6 +1712,16 @@ Examples:
         if normalized != args.year_month:
             print(f"  (normalized '{args.year_month}' → '{normalized}')")
         args.year_month = normalized
+
+    # Parse period for range-aware commands (check, check-summary, check-cross-utility)
+    if hasattr(args, "period") and args.period:
+        args._start_month, args._end_month = parse_period(args.period)
+        label = period_label(args._start_month, args._end_month)
+        if label != args.period:
+            print(f"  (period '{args.period}' → {label})")
+    elif hasattr(args, "period"):
+        args._start_month = None
+        args._end_month = None
 
     con = init_db(args.db)
 
@@ -1393,9 +1741,11 @@ Examples:
         else:
             print(df.to_string(index=False))
     elif args.command == "check":
-        detect_discrepancies(con, args.year_month)
+        detect_discrepancies(con, args._start_month, args._end_month)
     elif args.command == "check-summary":
-        detect_summary_discrepancies(con, args.year_month)
+        detect_summary_discrepancies(con, args._start_month, args._end_month)
+    elif args.command == "check-cross-utility":
+        check_cross_utility(con, args._start_month, args._end_month)
     elif args.command == "check-ingestion":
         detect_ingestion_issues(con, args.year_month, args.expected_files)
     elif args.command == "stats":
