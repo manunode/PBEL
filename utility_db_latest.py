@@ -1364,6 +1364,17 @@ Examples:
         parser.print_help()
         sys.exit(1)
 
+    # Normalize year_month: accept 2026_08, 2026/08, 2026.08 → 2026-08
+    if hasattr(args, "year_month") and args.year_month:
+        import re
+        normalized = re.sub(r'[_/.]', '-', args.year_month)
+        if not re.match(r'^\d{4}-\d{2}$', normalized):
+            print(f"ERROR: Invalid month format '{args.year_month}'. Expected YYYY-MM (e.g. 2026-08).")
+            sys.exit(1)
+        if normalized != args.year_month:
+            print(f"  (normalized '{args.year_month}' → '{normalized}')")
+        args.year_month = normalized
+
     con = init_db(args.db)
 
     if args.command == "ingest":
