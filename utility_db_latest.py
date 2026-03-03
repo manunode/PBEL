@@ -505,7 +505,32 @@ def detect_discrepancies(con, year_month):
     - NULL reading values (missing data points)
     - Out-of-order timestamps (non-monotonic within a source file)
     """
+    # Scan metadata
+    scan_stats = con.execute("""
+        SELECT COUNT(*) AS total_records,
+               COUNT(DISTINCT given_flat_id) AS distinct_flats,
+               COUNT(DISTINCT utility_type) AS distinct_utilities,
+               MIN(recorded_at) AS earliest,
+               MAX(recorded_at) AS latest
+        FROM readings
+        WHERE strftime(recorded_at, '%Y-%m') = ?
+    """, [year_month]).fetchone()
+
+    check_names = [
+        "Backward readings",
+        "Zero consumption",
+        "Gap detection (missing intervals)",
+        "Spike detection (>3σ)",
+        "Stale-then-resume (>24h flat)",
+        "NULL readings",
+        "Out-of-order timestamps",
+    ]
+
     print(f"Running granular discrepancy checks for {year_month}...")
+    print(f"  Scanning: {scan_stats[0]:,} records | {scan_stats[1]:,} flats | "
+          f"{scan_stats[2]} utility types | {scan_stats[3]} to {scan_stats[4]}")
+    print(f"  Checks:  {', '.join(check_names)}")
+    print(f"  {'─' * 72}")
     results = {}
 
     # 1. Backward readings (meter going backwards)
@@ -760,9 +785,23 @@ def detect_discrepancies(con, year_month):
     else:
         print("\n  7. OUT-OF-ORDER TIMESTAMPS: All timestamps monotonically increasing.")
 
-    # Summary
+    # Summary report
     total_issues = sum(len(v) for v in results.values())
-    print(f"\n  === Total issues found: {total_issues} across {sum(1 for v in results.values() if len(v) > 0)}/7 check categories ===")
+    flagged = sum(1 for v in results.values() if len(v) > 0)
+    print(f"\n  {'─' * 72}")
+    print(f"  SCAN SUMMARY — {year_month}")
+    print(f"  Records scanned : {scan_stats[0]:>10,}")
+    print(f"  Flats scanned   : {scan_stats[1]:>10,}")
+    print(f"  Total issues    : {total_issues:>10,}")
+    print(f"  Categories hit  : {flagged}/{len(check_names)}")
+    print()
+    result_keys = ["backward", "zero_consumption", "gaps", "spikes", "stale", "nulls", "out_of_order"]
+    for i, (name, key) in enumerate(zip(check_names, result_keys), 1):
+        count = len(results.get(key, []))
+        status = f"{count:,} found" if count > 0 else "PASS"
+        marker = "!!" if count > 0 else "ok"
+        print(f"    [{marker}] {i}. {name:<35s} {status}")
+    print(f"  {'─' * 72}")
     return results
 
 
@@ -792,7 +831,33 @@ def detect_summary_discrepancies(con, year_month=None):
     - Cross-utility correlation (electricity zero but water high, etc.)
     """
     scope = f"for {year_month}" if year_month else "across all months"
+
+    # Scan metadata
+    where_count, params_count = _summary_where(year_month)
+    scan_stats = con.execute(f"""
+        SELECT COUNT(*) AS total_rows,
+               COUNT(DISTINCT given_flat_id) AS distinct_flats,
+               COUNT(DISTINCT utility_type) AS distinct_utilities,
+               COUNT(DISTINCT year_month) AS distinct_months
+        FROM monthly_summary {where_count}
+    """, params_count).fetchone()
+
+    check_names = [
+        "Negative consumption",
+        "Zero consumption",
+        "Late opening reading (day > 2)",
+        "Early closing timestamp (day < 28)",
+        "Month continuity breaks",
+        "Outlier consumption (>3σ)",
+        "Cross-utility mismatch",
+        "Missing months",
+    ]
+
     print(f"Running monthly summary discrepancy checks {scope}...")
+    print(f"  Scanning: {scan_stats[0]:,} summary rows | {scan_stats[1]:,} flats | "
+          f"{scan_stats[2]} utility types | {scan_stats[3]} months")
+    print(f"  Checks:  {', '.join(check_names)}")
+    print(f"  {'─' * 72}")
     results = {}
 
     # 1. Negative consumption
@@ -1053,11 +1118,26 @@ def detect_summary_discrepancies(con, year_month=None):
         else:
             print("\n  8. MISSING MONTHS: Full coverage across all flat/utility/month combos.")
 
-    # Summary
+    # Summary report
     total_issues = sum(len(v) for v in results.values())
-    active_checks = sum(1 for v in results.values() if len(v) > 0)
+    flagged = sum(1 for v in results.values() if len(v) > 0)
     total_checks = len(results)
-    print(f"\n  === Total issues found: {total_issues} across {active_checks}/{total_checks} check categories ===")
+    result_keys = ["negative", "zero", "late_start", "early_close",
+                   "continuity", "outliers", "cross_utility", "missing_months"]
+    print(f"\n  {'─' * 72}")
+    print(f"  SCAN SUMMARY — monthly summaries {scope}")
+    print(f"  Rows scanned    : {scan_stats[0]:>10,}")
+    print(f"  Flats scanned   : {scan_stats[1]:>10,}")
+    print(f"  Months covered  : {scan_stats[3]:>10,}")
+    print(f"  Total issues    : {total_issues:>10,}")
+    print(f"  Categories hit  : {flagged}/{total_checks}")
+    print()
+    for i, (name, key) in enumerate(zip(check_names, result_keys), 1):
+        count = len(results.get(key, []))
+        status = f"{count:,} found" if count > 0 else "PASS" if key in results else "SKIPPED"
+        marker = "!!" if count > 0 else "ok" if key in results else "--"
+        print(f"    [{marker}] {i}. {name:<35s} {status}")
+    print(f"  {'─' * 72}")
     return results
 
 
@@ -1067,7 +1147,26 @@ def detect_ingestion_issues(con, year_month, expected_files_per_day=14):
     - File completeness: expected N files/day but fewer arrived
     - Row count anomalies: files with significantly fewer rows than peers
     """
+    # Scan metadata
+    scan_stats = con.execute("""
+        SELECT COUNT(*) AS total_records,
+               COUNT(DISTINCT source_file) AS distinct_files,
+               COUNT(DISTINCT CAST(recorded_at AS DATE)) AS distinct_days
+        FROM readings
+        WHERE strftime(recorded_at, '%Y-%m') = ?
+    """, [year_month]).fetchone()
+
+    check_names = [
+        "File completeness (files/day)",
+        "Row count anomalies (<50% median)",
+        "Ingestion log",
+    ]
+
     print(f"Running ingestion checks for {year_month} (expecting {expected_files_per_day} files/day)...")
+    print(f"  Scanning: {scan_stats[0]:,} records | {scan_stats[1]:,} source files | "
+          f"{scan_stats[2]} days with data")
+    print(f"  Checks:  {', '.join(check_names)}")
+    print(f"  {'─' * 72}")
     results = {}
 
     # 1. File completeness — how many distinct source files contributed to each day?
@@ -1141,7 +1240,25 @@ def detect_ingestion_issues(con, year_month, expected_files_per_day=14):
         print("\n  3. INGESTION LOG: No files ingested yet.")
 
     total_issues = len(file_completeness) + len(row_anomalies)
-    print(f"\n  === Ingestion issues found: {total_issues} ===")
+    flagged = (1 if len(file_completeness) > 0 else 0) + (1 if len(row_anomalies) > 0 else 0)
+    result_keys = ["file_completeness", "row_anomalies", "ingestion_log"]
+    print(f"\n  {'─' * 72}")
+    print(f"  SCAN SUMMARY — ingestion checks {year_month}")
+    print(f"  Records scanned : {scan_stats[0]:>10,}")
+    print(f"  Source files    : {scan_stats[1]:>10,}")
+    print(f"  Days with data  : {scan_stats[2]:>10,}")
+    print(f"  Total issues    : {total_issues:>10,}")
+    print(f"  Categories hit  : {flagged}/2")
+    print()
+    for i, (name, key) in enumerate(zip(check_names, result_keys), 1):
+        count = len(results.get(key, []))
+        if key == "ingestion_log":
+            print(f"    [--] {i}. {name:<35s} {count:,} files logged")
+        else:
+            status = f"{count:,} found" if count > 0 else "PASS"
+            marker = "!!" if count > 0 else "ok"
+            print(f"    [{marker}] {i}. {name:<35s} {status}")
+    print(f"  {'─' * 72}")
     return results
 
 
