@@ -50,8 +50,7 @@ def show_monthly_summary(con, year_month):
     """Display the monthly summary for a given month."""
     df = con.execute("""
         SELECT utility_type, given_flat_id, year_month,
-               opening_reading, closing_reading,
-               opening_reading - closing_reading AS consumption,
+               opening_reading, closing_reading, monthly_reading,
                opening_timestamp, closing_timestamp
         FROM monthly_summary
         WHERE year_month = ?
@@ -150,11 +149,13 @@ def db_stats(con):
     """Print database statistics."""
     readings_count = con.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
     summary_count = con.execute("SELECT COUNT(*) FROM monthly_summary").fetchone()[0]
+    discrepancy_count = con.execute("SELECT COUNT(*) FROM monthly_discrepancy").fetchone()[0]
     ingestion_count = con.execute("SELECT COUNT(*) FROM ingestion_log").fetchone()[0]
 
     print("Database statistics:")
     print(f"  Readings:        {readings_count:>10,}")
     print(f"  Monthly summary: {summary_count:>10,}")
+    print(f"  Discrepancies:   {discrepancy_count:>10,}")
     print(f"  Files ingested:  {ingestion_count:>10,}")
 
     if readings_count > 0:
