@@ -5,10 +5,33 @@ All check commands: granular discrepancies, summary anomalies,
 cross-utility analysis, and ingestion completeness.
 """
 
+import json
+
 from utility_db_core import month_filter_sql, period_label
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+def _record_discrepancy(con, rows, check_name, severity="warning"):
+    """
+    Insert discrepancy rows into monthly_discrepancy.
+    `rows` is a list of dicts with keys:
+      utility_type, given_flat_id, year_month, remark, detail (optional dict).
+    Existing rows for the same PK are replaced.
+    """
+    if not rows:
+        return
+    con.executemany("""
+        INSERT OR REPLACE INTO monthly_discrepancy
+            (utility_type, given_flat_id, year_month, check_name, severity, remark, detail_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (r['utility_type'], r['given_flat_id'], r['year_month'],
+         check_name, severity, r.get('remark', ''),
+         json.dumps(r['detail']) if r.get('detail') else None)
+        for r in rows
+    ])
+
 
 def _summary_where(start_month, end_month, base_condition=""):
     """Helper to build WHERE clause with optional period filter for monthly_summary."""
@@ -462,27 +485,33 @@ def detect_summary_discrepancies(con, start_month=None, end_month=None):
     results = {}
 
     # 1. Negative consumption
-    where, params = _summary_where(start_month, end_month, "(closing_reading - opening_reading) < 0")
+    where, params = _summary_where(start_month, end_month, "monthly_reading < 0")
     neg = con.execute(f"""
         SELECT utility_type, given_flat_id, year_month,
-               opening_reading, closing_reading,
-               closing_reading - opening_reading AS consumption
+               opening_reading, closing_reading, monthly_reading
         FROM monthly_summary {where}
-        ORDER BY consumption ASC
+        ORDER BY monthly_reading ASC
     """, params).fetchdf()
     results["negative"] = neg
 
     if not neg.empty:
         print(f"\n  1. NEGATIVE CONSUMPTION ({len(neg)} rows):")
         print(neg.head(20).to_string(index=False))
+        _record_discrepancy(con, [
+            {'utility_type': r.utility_type, 'given_flat_id': r.given_flat_id,
+             'year_month': r.year_month,
+             'remark': f"Negative monthly_reading: {r.monthly_reading:.2f} (open={r.opening_reading}, close={r.closing_reading})",
+             'detail': {'opening_reading': r.opening_reading, 'closing_reading': r.closing_reading, 'monthly_reading': r.monthly_reading}}
+            for r in neg.itertuples()
+        ], 'negative_consumption', 'error')
     else:
         print("\n  1. NEGATIVE CONSUMPTION: None.")
 
     # 2. Zero consumption
-    where, params = _summary_where(start_month, end_month, "closing_reading = opening_reading")
+    where, params = _summary_where(start_month, end_month, "monthly_reading = 0")
     zero = con.execute(f"""
         SELECT utility_type, given_flat_id, year_month,
-               opening_reading, closing_reading
+               opening_reading, closing_reading, monthly_reading
         FROM monthly_summary {where}
         ORDER BY year_month, utility_type, given_flat_id
     """, params).fetchdf()
@@ -491,6 +520,13 @@ def detect_summary_discrepancies(con, start_month=None, end_month=None):
     if not zero.empty:
         print(f"\n  2. ZERO CONSUMPTION ({len(zero)} rows):")
         print(zero.head(20).to_string(index=False))
+        _record_discrepancy(con, [
+            {'utility_type': r.utility_type, 'given_flat_id': r.given_flat_id,
+             'year_month': r.year_month,
+             'remark': f"Zero monthly_reading (open={r.opening_reading}, close={r.closing_reading})",
+             'detail': {'opening_reading': r.opening_reading, 'closing_reading': r.closing_reading}}
+            for r in zero.itertuples()
+        ], 'zero_consumption', 'warning')
     else:
         print("\n  2. ZERO CONSUMPTION: None.")
 
@@ -508,6 +544,13 @@ def detect_summary_discrepancies(con, start_month=None, end_month=None):
     if not late_start.empty:
         print(f"\n  3. LATE OPENING READING — day > 2 ({len(late_start)} rows):")
         print(late_start.head(20).to_string(index=False))
+        _record_discrepancy(con, [
+            {'utility_type': r.utility_type, 'given_flat_id': r.given_flat_id,
+             'year_month': r.year_month,
+             'remark': f"Opening reading on day {r.opening_day} (expected day <= 2)",
+             'detail': {'opening_timestamp': str(r.opening_timestamp), 'opening_day': int(r.opening_day)}}
+            for r in late_start.itertuples()
+        ], 'late_opening', 'warning')
     else:
         print("\n  3. LATE OPENING READING: All within first 2 days.")
 
@@ -527,6 +570,13 @@ def detect_summary_discrepancies(con, start_month=None, end_month=None):
         print(early_close.head(20).to_string(index=False))
         if len(early_close) > 20:
             print(f"     ... and {len(early_close) - 20} more.")
+        _record_discrepancy(con, [
+            {'utility_type': r.utility_type, 'given_flat_id': r.given_flat_id,
+             'year_month': r.year_month,
+             'remark': f"Closing reading on day {r.closing_day} (expected day >= 28)",
+             'detail': {'closing_timestamp': str(r.closing_timestamp), 'closing_day': int(r.closing_day)}}
+            for r in early_close.itertuples()
+        ], 'early_closing', 'warning')
     else:
         print("\n  4. EARLY CLOSING TIMESTAMP: All closing readings at or after day 28.")
 
@@ -567,38 +617,41 @@ def detect_summary_discrepancies(con, start_month=None, end_month=None):
         print(continuity.head(20).to_string(index=False))
         if len(continuity) > 20:
             print(f"     ... and {len(continuity) - 20} more.")
+        _record_discrepancy(con, [
+            {'utility_type': r.utility_type, 'given_flat_id': r.given_flat_id,
+             'year_month': r.year_month,
+             'remark': f"Continuity break: prev_closing={r.prev_closing}, curr_opening={r.curr_opening}, gap={r.gap:.4f}",
+             'detail': {'prev_month': r.prev_month, 'prev_closing': r.prev_closing,
+                        'curr_opening': r.curr_opening, 'gap': r.gap}}
+            for r in continuity.itertuples()
+        ], 'continuity_break', 'error')
     else:
         print("\n  5. MONTH CONTINUITY: All opening readings match previous closing.")
 
     # 6. Outlier consumption
     mf_sql, mf_params = month_filter_sql("c.year_month", start_month, end_month) if start_month else ("1=1", [])
     outliers = con.execute(f"""
-        WITH consumption AS (
-            SELECT utility_type, given_flat_id, year_month,
-                   closing_reading - opening_reading AS consumption
-            FROM monthly_summary
-        ),
-        stats AS (
+        WITH stats AS (
             SELECT utility_type, given_flat_id,
-                   AVG(consumption) AS mean_consumption,
-                   STDDEV(consumption) AS std_consumption,
+                   AVG(monthly_reading) AS mean_consumption,
+                   STDDEV(monthly_reading) AS std_consumption,
                    COUNT(*) AS num_months
-            FROM consumption
+            FROM monthly_summary
             GROUP BY utility_type, given_flat_id
-            HAVING COUNT(*) >= 3 AND STDDEV(consumption) > 0
+            HAVING COUNT(*) >= 3 AND STDDEV(monthly_reading) > 0
         )
         SELECT c.utility_type, c.given_flat_id, c.year_month,
-               ROUND(c.consumption, 4) AS consumption,
+               ROUND(c.monthly_reading, 4) AS monthly_reading,
                ROUND(s.mean_consumption, 4) AS historical_mean,
                ROUND(s.std_consumption, 4) AS historical_std,
-               ROUND((c.consumption - s.mean_consumption) / s.std_consumption, 2) AS z_score
-        FROM consumption c
+               ROUND((c.monthly_reading - s.mean_consumption) / s.std_consumption, 2) AS z_score
+        FROM monthly_summary c
         JOIN stats s
           ON c.utility_type = s.utility_type
          AND c.given_flat_id = s.given_flat_id
         WHERE {mf_sql}
-          AND ABS(c.consumption - s.mean_consumption) / s.std_consumption > 3
-        ORDER BY ABS((c.consumption - s.mean_consumption) / s.std_consumption) DESC
+          AND ABS(c.monthly_reading - s.mean_consumption) / s.std_consumption > 3
+        ORDER BY ABS((c.monthly_reading - s.mean_consumption) / s.std_consumption) DESC
     """, mf_params).fetchdf()
     results["outliers"] = outliers
 
@@ -607,25 +660,28 @@ def detect_summary_discrepancies(con, start_month=None, end_month=None):
         print(outliers.head(20).to_string(index=False))
         if len(outliers) > 20:
             print(f"     ... and {len(outliers) - 20} more.")
+        _record_discrepancy(con, [
+            {'utility_type': r.utility_type, 'given_flat_id': r.given_flat_id,
+             'year_month': r.year_month,
+             'remark': f"Outlier: monthly_reading={r.monthly_reading}, z_score={r.z_score} (mean={r.historical_mean}, std={r.historical_std})",
+             'detail': {'monthly_reading': r.monthly_reading, 'z_score': r.z_score,
+                        'historical_mean': r.historical_mean, 'historical_std': r.historical_std}}
+            for r in outliers.itertuples()
+        ], 'outlier_consumption', 'warning')
     else:
         print("\n  6. OUTLIER CONSUMPTION: None detected (requires >=3 months of history).")
 
     # 7. Cross-utility correlation
     where, params = _summary_where(start_month, end_month)
     cross_utility = con.execute(f"""
-        WITH consumption AS (
-            SELECT utility_type, given_flat_id, year_month,
-                   closing_reading - opening_reading AS consumption
-            FROM monthly_summary {where}
-        ),
-        flat_month AS (
+        WITH flat_month AS (
             SELECT given_flat_id, year_month,
                    COUNT(*) AS num_utilities,
-                   COUNT(*) FILTER (WHERE consumption = 0) AS zero_count,
-                   COUNT(*) FILTER (WHERE consumption > 0) AS active_count,
-                   LIST(utility_type) FILTER (WHERE consumption = 0) AS zero_utilities,
-                   LIST(utility_type) FILTER (WHERE consumption > 0) AS active_utilities
-            FROM consumption
+                   COUNT(*) FILTER (WHERE monthly_reading = 0) AS zero_count,
+                   COUNT(*) FILTER (WHERE monthly_reading > 0) AS active_count,
+                   LIST(utility_type) FILTER (WHERE monthly_reading = 0) AS zero_utilities,
+                   LIST(utility_type) FILTER (WHERE monthly_reading > 0) AS active_utilities
+            FROM monthly_summary {where}
             GROUP BY given_flat_id, year_month
             HAVING COUNT(*) > 1
         )
@@ -643,6 +699,19 @@ def detect_summary_discrepancies(con, start_month=None, end_month=None):
         print(cross_utility.head(20).to_string(index=False))
         if len(cross_utility) > 20:
             print(f"     ... and {len(cross_utility) - 20} more.")
+        # Record one discrepancy per zero-utility per flat/month
+        disc_rows = []
+        for r in cross_utility.itertuples():
+            zero_utils = r.zero_utilities if isinstance(r.zero_utilities, list) else [r.zero_utilities]
+            for ut in zero_utils:
+                disc_rows.append({
+                    'utility_type': ut, 'given_flat_id': r.given_flat_id,
+                    'year_month': r.year_month,
+                    'remark': f"Cross-utility mismatch: {ut} is zero while {r.active_utilities} are active",
+                    'detail': {'zero_utilities': list(zero_utils),
+                               'active_utilities': list(r.active_utilities) if isinstance(r.active_utilities, list) else [r.active_utilities]}
+                })
+        _record_discrepancy(con, disc_rows, 'cross_utility_mismatch', 'warning')
     else:
         print("\n  7. CROSS-UTILITY MISMATCH: None detected.")
 
@@ -766,7 +835,7 @@ def check_cross_utility(con, start_month=None, end_month=None):
                    LIST(DISTINCT utility_type ORDER BY utility_type) AS utilities_present,
                    COUNT(DISTINCT utility_type) AS num_utilities,
                    COUNT(DISTINCT year_month) AS months_active,
-                   ROUND(SUM(closing_reading - opening_reading), 2) AS total_consumption
+                   ROUND(SUM(monthly_reading), 2) AS total_consumption
             FROM monthly_summary {where}
             GROUP BY given_flat_id
         )
@@ -837,7 +906,7 @@ def check_cross_utility(con, start_month=None, end_month=None):
     zero_profiles = con.execute(f"""
         WITH consumption AS (
             SELECT given_flat_id, utility_type,
-                   SUM(closing_reading - opening_reading) AS total_consumption,
+                   SUM(monthly_reading) AS total_consumption,
                    COUNT(*) AS months_present
             FROM monthly_summary {where}
             GROUP BY given_flat_id, utility_type
@@ -887,6 +956,63 @@ def check_cross_utility(con, start_month=None, end_month=None):
     if not zero_profiles.empty:
         print(f"  Zero-on-some flats  : {len(zero_profiles):>8,}")
     print(f"  {'─' * 72}")
+
+
+# ── Discrepancy Report ────────────────────────────────────────────────────
+
+def show_discrepancies(con, start_month=None, end_month=None, check_name=None, severity=None):
+    """
+    Display recorded discrepancies from the monthly_discrepancy table.
+    Supports filtering by period, check_name, and severity.
+    """
+    clauses = []
+    params = []
+    if start_month:
+        frag, p = month_filter_sql("year_month", start_month, end_month or start_month)
+        clauses.append(frag)
+        params.extend(p)
+    if check_name:
+        clauses.append("check_name = ?")
+        params.append(check_name)
+    if severity:
+        clauses.append("severity = ?")
+        params.append(severity)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    label = period_label(start_month, end_month) if start_month else "all months"
+
+    df = con.execute(f"""
+        SELECT utility_type, given_flat_id, year_month, check_name,
+               severity, remark
+        FROM monthly_discrepancy {where}
+        ORDER BY year_month, check_name, utility_type, given_flat_id
+    """, params).fetchdf()
+
+    if df.empty:
+        print(f"No discrepancies recorded for {label}.")
+        return df
+
+    # Summary by check_name
+    summary = con.execute(f"""
+        SELECT check_name, severity,
+               COUNT(*) AS count
+        FROM monthly_discrepancy {where}
+        GROUP BY check_name, severity
+        ORDER BY count DESC
+    """, params).fetchdf()
+
+    print(f"Monthly discrepancy report — {label}")
+    print(f"  Total discrepancies: {len(df):,}")
+    print(f"  {'─' * 72}")
+    print(f"  By check:")
+    for _, row in summary.iterrows():
+        sev_marker = "!!" if row['severity'] == 'error' else "**" if row['severity'] == 'warning' else ".."
+        print(f"    [{sev_marker}] {row['check_name']:<35s} {row['count']:>6,}  ({row['severity']})")
+    print(f"  {'─' * 72}")
+    print(df.head(50).to_string(index=False))
+    if len(df) > 50:
+        print(f"  ... and {len(df) - 50} more.")
+    print(f"  {'─' * 72}")
+    return df
 
 
 # ── Ingestion Checks ──────────────────────────────────────────────────────

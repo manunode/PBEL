@@ -61,6 +61,22 @@ def init_db(db_path=DEFAULT_DB_PATH):
         )
     """)
 
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_discrepancy (
+            utility_type      VARCHAR NOT NULL,
+            given_flat_id     VARCHAR NOT NULL,
+            year_month        VARCHAR NOT NULL,  -- 'YYYY-MM'
+            check_name        VARCHAR NOT NULL,   -- e.g. 'negative_consumption', 'cross_utility_mismatch'
+            severity          VARCHAR NOT NULL DEFAULT 'warning',  -- 'info', 'warning', 'error'
+            remark            VARCHAR,            -- human-readable description
+            detail_json       VARCHAR,            -- optional JSON with extra data
+            detected_at       TIMESTAMP DEFAULT current_timestamp,
+            PRIMARY KEY (utility_type, given_flat_id, year_month, check_name)
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_discrepancy_month ON monthly_discrepancy (year_month)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_discrepancy_check ON monthly_discrepancy (check_name)")
+
     # Ingestion log with file hash for content-based deduplication
     con.execute("""
         CREATE TABLE IF NOT EXISTS ingestion_log (

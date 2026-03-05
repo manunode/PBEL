@@ -25,6 +25,7 @@ from utility_summarize import (
 from utility_check import (
     detect_discrepancies, detect_summary_discrepancies,
     check_cross_utility, detect_ingestion_issues,
+    show_discrepancies,
 )
 
 
@@ -70,6 +71,11 @@ Examples:
 
   # Ingestion completeness checks
   python utility_db.py check-ingestion 2025-01
+
+  # Show recorded discrepancies
+  python utility_db.py discrepancies 2025-Q1
+  python utility_db.py discrepancies --check cross_utility_mismatch
+  python utility_db.py discrepancies --severity error
 
   # Show database stats
   python utility_db.py stats
@@ -118,6 +124,12 @@ Period formats:
     p_check_ingest.add_argument("year_month", help="Month to check (YYYY-MM)")
     p_check_ingest.add_argument("--expected-files", type=int, default=14,
                                 help="Expected source files per day (default: 14)")
+
+    p_discrepancies = sub.add_parser("discrepancies", help="Show recorded monthly discrepancies")
+    p_discrepancies.add_argument("period", nargs="?", help="Period (optional; all months if omitted)")
+    p_discrepancies.add_argument("--check", help="Filter by check name (e.g. negative_consumption)")
+    p_discrepancies.add_argument("--severity", choices=["info", "warning", "error"],
+                                  help="Filter by severity level")
 
     sub.add_parser("stats", help="Show database statistics")
 
@@ -176,6 +188,15 @@ Period formats:
         elif args.command == "check-ingestion":
             ym = _normalize_period(args.year_month)
             detect_ingestion_issues(con, ym, args.expected_files)
+
+        elif args.command == "discrepancies":
+            if args.period:
+                period = _normalize_period(args.period)
+                start_month, end_month = parse_period(period)
+                show_discrepancies(con, start_month, end_month,
+                                   check_name=args.check, severity=args.severity)
+            else:
+                show_discrepancies(con, check_name=args.check, severity=args.severity)
 
         elif args.command == "stats":
             db_stats(con)
