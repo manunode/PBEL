@@ -54,6 +54,7 @@ def init_db(db_path=DEFAULT_DB_PATH):
             year_month        VARCHAR NOT NULL,  -- 'YYYY-MM'
             opening_reading   DOUBLE,
             closing_reading   DOUBLE,
+            monthly_reading   DOUBLE,
             opening_timestamp TIMESTAMP,
             closing_timestamp TIMESTAMP,
             computed_at       TIMESTAMP DEFAULT current_timestamp,

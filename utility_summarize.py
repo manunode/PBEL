@@ -21,7 +21,7 @@ def compute_monthly_summary(con, year_month):
     con.execute("""
         INSERT OR REPLACE INTO monthly_summary
             (utility_type, given_flat_id, year_month,
-             opening_reading, closing_reading,
+             opening_reading, closing_reading, monthly_reading,
              opening_timestamp, closing_timestamp)
         SELECT
             utility_type,
@@ -29,6 +29,7 @@ def compute_monthly_summary(con, year_month):
             ? AS year_month,
             FIRST(reading_value ORDER BY recorded_at) AS opening_reading,
             LAST(reading_value ORDER BY recorded_at)  AS closing_reading,
+            LAST(reading_value ORDER BY recorded_at) - FIRST(reading_value ORDER BY recorded_at) AS monthly_reading,
             MIN(recorded_at) AS opening_timestamp,
             MAX(recorded_at) AS closing_timestamp
         FROM readings
