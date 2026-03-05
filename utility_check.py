@@ -28,7 +28,7 @@ def _record_discrepancy(con, rows, check_name, severity="warning"):
     """, [
         (r['utility_type'], r['given_flat_id'], r['year_month'],
          check_name, severity, r.get('remark', ''),
-         json.dumps(r['detail']) if r.get('detail') else None)
+         json.dumps(r['detail'], default=str) if r.get('detail') else None)
         for r in rows
     ])
 
